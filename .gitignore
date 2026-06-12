@@ -1,0 +1,14 @@
+# build artifacts (libtuned_matmul.so is auto-built from tuned_matmul.cu)
+*.so
+*.o
+
+# large binaries / wheels
+*.whl
+
+# benchmark run outputs
+run_*.json
+run_*.log
+
+# python cache
+__pycache__/
+*.pyc

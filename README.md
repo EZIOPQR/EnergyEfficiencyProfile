@@ -29,8 +29,23 @@ Key options:
 | `--warmup-seconds` | 10 | Warmup time before each workload |
 | `--measure-seconds` | 30 | Measurement window per workload |
 | `--burst` | 32 | Ops launched between CUDA syncs (amortizes launch latency) |
+| `--tune-matmul` / `--no-tune-matmul` | on | Autotune the cuBLASLt algo per matmul size before benchmarking |
+| `--tune-iters` | 30 | Timed iterations per candidate algo during autotune |
 | `--rails` | `VDD_GPU_SOC,VDD_CPU_CV` | tegrastats rails summed into the measured power |
 | `--output` | — | Write full results to a JSON file |
+
+## Matmul autotuning
+
+By default the matmul (tensor) workloads do **not** use `torch.matmul` — its cuBLAS
+heuristic is badly miscalibrated on Orin's `sm_87` and leaves 40–70% of dense bf16
+throughput on the table (e.g. ~24 vs ~40 TFLOPS at 8192²). Instead, before
+benchmarking, `energy_bench.py` enumerates the cuBLASLt candidate algorithms for
+each size, times them at steady-state clock, and caches the fastest (via
+`libtuned_matmul.so`, auto-built from `tuned_matmul.cu` with `nvcc` on first run).
+This makes the TENSOR results reflect the GPU's *achievable* peak efficiency
+(~40 TFLOPS ≈ 95% of the dense bf16 ceiling) rather than the cuBLAS default. Pass
+`--no-tune-matmul` to fall back to plain `torch.matmul`. Vector ops are elementwise
+and unaffected. Requires `nvcc` (CUDA toolkit) on `PATH`.
 
 ## Measurement protocol
 

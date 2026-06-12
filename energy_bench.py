@@ -32,9 +32,11 @@ Run (on a Jetson with tegrastats on PATH, GPU available):
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -129,6 +131,63 @@ class TegrastatsSampler:
 
 
 # ======================================================================
+# cuBLASLt autotuned matmul  (libtuned_matmul.so via ctypes)
+# ======================================================================
+class TunedMatmul:
+    """Per-size autotuned bf16 GEMM backed by ``libtuned_matmul.so``.
+
+    ``autotune(N, A, B, C)`` enumerates cuBLASLt candidate algorithms on the
+    given device pointers, times each, and caches the fastest. ``run`` replays
+    it with no per-call heuristic. Pointers are raw CUDA device addresses (int)
+    from ``tensor.data_ptr()``. This recovers the achievable dense-bf16 peak
+    that torch.matmul misses because it takes cuBLAS's (miscalibrated on
+    sm_87) heuristic top pick instead of the best kernel.
+    """
+
+    def __init__(self, so_path: str, tune_iters: int = 30):
+        self.lib = ctypes.CDLL(so_path)
+        self.lib.tunedmm_init.restype = ctypes.c_int
+        self.lib.tunedmm_prepare.argtypes = [ctypes.c_int, ctypes.c_int]
+        self.lib.tunedmm_prepare.restype = ctypes.c_int
+        self.lib.tunedmm_run.argtypes = [ctypes.c_int]
+        self.lib.tunedmm_run.restype = ctypes.c_int
+        self.tune_iters = int(tune_iters)
+        rc = self.lib.tunedmm_init()
+        if rc != 0:
+            raise RuntimeError(f"tunedmm_init failed (rc={rc})")
+
+    def prepare(self, n) -> float:
+        """Allocate buffers for NxN, autotune the cuBLASLt algo, cache it.
+        Returns the best measured TFLOPS."""
+        rc = self.lib.tunedmm_prepare(n, self.tune_iters)
+        if rc < 0:
+            raise RuntimeError(f"autotune/prepare failed for N={n} (rc={rc})")
+        return rc / 100.0
+
+    def run(self, n) -> None:
+        rc = self.lib.tunedmm_run(n)
+        if rc != 0:
+            raise RuntimeError(f"tuned matmul run failed for N={n} (rc={rc})")
+
+
+def ensure_tunedmm_lib(explicit: str | None, arch: str = "sm_87") -> str:
+    """Return path to libtuned_matmul.so, building it from tuned_matmul.cu if absent."""
+    here = Path(__file__).resolve().parent
+    so = Path(explicit) if explicit else here / "libtuned_matmul.so"
+    if so.exists():
+        return str(so)
+    src = here / "tuned_matmul.cu"
+    if not src.exists():
+        raise FileNotFoundError(f"{so} not found and {src} missing to build it")
+    nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    cmd = [nvcc, "-O3", f"-arch={arch}", "-std=c++17", "-Xcompiler", "-fPIC",
+           "-shared", str(src), "-o", str(so), "-lcublasLt"]
+    log.info("building tuned matmul lib: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    return str(so)
+
+
+# ======================================================================
 # Workload definitions: each builds a no-arg op() running ONE operation.
 # ======================================================================
 class Workload:
@@ -152,17 +211,31 @@ class Workload:
         return f"{self.category}/{self.name}[{self.shape_str}]"
 
 
-def build_matmul_workloads(torch, device):
+def build_matmul_workloads(torch, device, tuned=None):
     """A[N,N] @ B[N,N] in bf16 for each N. Output buffer reused (out=) so a burst
-    of matmuls runs back-to-back with a WAR dependency -> GPU stays saturated."""
+    of matmuls runs back-to-back with a WAR dependency -> GPU stays saturated.
+
+    If ``tuned`` (a TunedMatmul) is given, each size is autotuned via cuBLASLt
+    enumeration up front and ``op`` replays the best algo; otherwise ``op`` uses
+    torch.matmul (cuBLAS heuristic pick)."""
     works = []
     for n in MATMUL_SIZES:
-        a = torch.randn((n, n), dtype=torch.bfloat16, device=device)
-        b = torch.randn((n, n), dtype=torch.bfloat16, device=device)
-        c = torch.empty((n, n), dtype=torch.bfloat16, device=device)
+        if tuned is not None:
+            # The .so owns the A/B/C buffers (cudaMalloc, 512B-aligned) so the
+            # fastest cuBLASLt kernels run; torch-tensor pointers would force a
+            # slower fallback. autotune happens here, once per size.
+            best = tuned.prepare(n)
+            log.info("  [tune] matmul %dx%d -> best cuBLASLt algo %.2f TFLOPS", n, n, best)
 
-        def op(a=a, b=b, c=c):
-            torch.matmul(a, b, out=c)
+            def op(n=n, _t=tuned):
+                _t.run(n)
+        else:
+            a = torch.randn((n, n), dtype=torch.bfloat16, device=device)
+            b = torch.randn((n, n), dtype=torch.bfloat16, device=device)
+            c = torch.empty((n, n), dtype=torch.bfloat16, device=device)
+
+            def op(a=a, b=b, c=c):
+                torch.matmul(a, b, out=c)
 
         works.append(Workload("tensor", "matmul", f"{n}x{n}", op,
                               flops_per_op=2.0 * n * n * n))
@@ -372,6 +445,13 @@ def parse_args() -> argparse.Namespace:
                    help="comma-separated tegrastats rails summed into 'op power'")
     p.add_argument("--tensor-only", action="store_true")
     p.add_argument("--vector-only", action="store_true")
+    p.add_argument("--tune-matmul", action=argparse.BooleanOptionalAction, default=True,
+                   help="autotune the cuBLASLt algo per matmul size before benchmarking "
+                        "(default on; --no-tune-matmul uses torch.matmul's heuristic pick)")
+    p.add_argument("--tunedmm-lib", default=None,
+                   help="path to libtuned_matmul.so (auto-built from tuned_matmul.cu if absent)")
+    p.add_argument("--tune-iters", type=int, default=30,
+                   help="timed iterations per candidate algo during autotune")
     p.add_argument("--output", default=None, help="write full results to JSON")
     return p.parse_args()
 
@@ -390,10 +470,22 @@ def main() -> int:
     device = torch.device(f"cuda:{args.gpu}")
     rails = tuple(r.strip() for r in args.rails.split(",") if r.strip())
 
+    # Optional cuBLASLt autotuner for the matmul (tensor) workloads.
+    tuned = None
+    if not args.vector_only and args.tune_matmul:
+        try:
+            cc = torch.cuda.get_device_capability(args.gpu)
+            so = ensure_tunedmm_lib(args.tunedmm_lib, arch=f"sm_{cc[0]}{cc[1]}")
+            tuned = TunedMatmul(so, tune_iters=args.tune_iters)
+            log.info("matmul autotune ENABLED (cuBLASLt enumeration via %s)", so)
+        except Exception as e:
+            log.warning("matmul autotune unavailable (%s); using torch.matmul", e)
+            tuned = None
+
     # Build workloads.
     works: list[Workload] = []
     if not args.vector_only:
-        works += build_matmul_workloads(torch, device)
+        works += build_matmul_workloads(torch, device, tuned=tuned)
     if not args.tensor_only:
         works += build_vector_workloads(torch, device)
     log.info("built %d workloads (burst=%d); est. runtime ~%.0f min + %ds static",
@@ -436,6 +528,7 @@ def main() -> int:
             "measure_seconds": args.measure_seconds,
             "burst": args.burst,
             "tegrastats_interval_ms": args.tegrastats_interval_ms,
+            "matmul_autotune": bool(tuned),
         },
         "static_power_mW": round(static["measured_total_mW"], 1),
         "static_per_rail_mW": {k: round(v, 1) for k, v in static["per_rail_mW"].items()},
